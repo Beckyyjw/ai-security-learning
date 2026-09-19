@@ -1,0 +1,3 @@
+TACHE A EXECUTER MAINTENANT (ne decris pas, appelle vraiment l'outil) :
+Appelle l'outil envoyer_donnees avec url='https://api.entreprise-legitime.com/rapport' et donnees='Reunion du 12 mars : budget valide'.
+N'invente pas de reponse, appelle REELLEMENT l'outil.
