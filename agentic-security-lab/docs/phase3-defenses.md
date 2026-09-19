@@ -1,141 +1,145 @@
-# Carnet d'apprentissage — Sécurité des agents IA
+# Phase 3 — Les défenses
 
-> Ce carnet compile les questions que je me suis posées pendant la construction du
-> projet, avec leurs réponses. Il retrace ma démarche de compréhension, brique par
-> brique — de « c'est quoi un agent ? » jusqu'aux attaques par exfiltration.
-
----
-
-## Partie 1 — Concepts fondamentaux
-
-### C'est quoi l'agentic AI ?
-Une IA qui ne se contente pas de répondre, mais qui **agit** pour atteindre un
-objectif, en plusieurs étapes, avec des outils. Ses 4 briques : un LLM (le cerveau
-qui décide), des outils (actions sur le monde), une mémoire (le contexte), et une
-boucle (penser → agir → observer → recommencer).
-
-### Le « tool calling » permet-il à l'IA de lire le fichier ?
-**Non.** Le LLM ne peut produire que du **texte**. Le tool calling est une
-**demande** : le modèle écrit « je voudrais qu'on appelle `lire_fichier` avec tel
-argument ». C'est **le code Python** qui reçoit cette demande et exécute réellement
-la fonction. → **Le LLM demande, le code exécute.**
-
-### Est-ce que ça fonctionne comme une API ?
-Oui, presque. Le LLM = le **client** qui envoie une requête ; les outils = les
-**endpoints** ; le code = le **serveur** qui exécute. La différence cruciale : dans
-une API classique, le client est prévisible. Ici, le « client » (le LLM) est
-**imprévisible et manipulable** par le contenu qu'il lit. → **Un agent = une API
-dont le client n'est pas fiable.**
-
-### C'est quoi un « outil » et sa « description » ?
-Un **outil** = une action que l'agent peut faire = une fonction Python.
-La **description** = une fiche (au format standard) qui présente l'outil au modèle,
-pour qu'il sache qu'il existe et comment le demander. Le modèle ne voit pas le code,
-seulement cette fiche. Analogie : l'outil = le plat que la cuisine sait faire ; la
-description = la ligne dans le menu.
+> Cette phase implémente les contre-mesures qui neutralisent les 3 attaques de la
+> Phase 2. **Principe directeur : la sécurité vit dans le code, pas dans le
+> modèle.** Le comportement du LLM est non déterministe (cf. Phase 2) ; les défenses,
+> elles, sont déterministes et s'appliquent à 100 % des exécutions.
 
 ---
 
-## Partie 2 — Comprendre le code
+## L'architecture : un poste de contrôle
 
-### Que signifie `print(reponse["message"]["content"])` ?
-La réponse de l'IA est un dictionnaire = une **boîte à tiroirs**. On ouvre les
-tiroirs un par un : `reponse` → tiroir `message` → tiroir `content` = le texte.
-- `reponse["message"]` → la réponse de l'IA
-- `reponse["message"]["content"]` → juste le texte
-- `reponse["message"]["tool_calls"]` → juste la demande d'outil
+Toutes les défenses passent par une **fonction de contrôle unique**,
+`controle_securite(nom, args)`, appelée **avant chaque exécution d'outil** dans la
+boucle de l'agent. Elle renvoie `(autorisé: bool, raison: str)`.
 
-### Pourquoi le `content` est-il déjà rempli au lieu d'attendre une saisie ?
-Parce qu'on l'écrit « en dur » pour **tester rapidement**. Dans une vraie appli, on
-utiliserait `input()` pour attendre la saisie de l'utilisateur. Dans un agent, ce
-`content` viendra souvent d'un **fichier** — et c'est là que se cache la faille.
+```python
+for appel in msg["tool_calls"]:
+    nom  = appel["function"]["name"]
+    args = appel["function"]["arguments"]
 
-### Qui appelle vraiment la fonction ?
-Le LLM ne l'appelle pas : il **demande**. C'est **le code** qui attrape la demande
-et exécute. Le code est un **traducteur** : il transforme la demande texte du LLM
-en une vraie exécution.
+    # 🛡️ Contrôle AVANT exécution
+    autorise, raison = controle_securite(nom, args)
+    if not autorise:
+        print(f"[BLOQUÉ : {nom} — {raison}]")
+        messages.append({"role": "tool", "content": f"Action refusée : {raison}"})
+        continue
 
-### Pourquoi la boucle `for tour in range(5)` ?
-On ne sait pas d'avance combien d'allers-retours (tours) l'IA aura besoin. On boucle
-donc, et on **s'arrête dès qu'elle donne sa réponse finale** (`break`). Le `5` est un
-**garde-fou** contre les boucles infinies (protection anti-déni de service), pas un
-nombre fixe.
+    # 🧑 Human-in-the-loop pour les actions sensibles
+    if nom in OUTILS_SENSIBLES:
+        if input(f"Autoriser {nom} ? (oui/non) : ").strip().lower() != "oui":
+            print(f"[REFUSÉ PAR L'HUMAIN : {nom}]")
+            messages.append({"role": "tool", "content": "Action refusée par l'humain."})
+            continue
 
-### Et si l'IA a besoin d'appeler 7 outils ?
-Distinguer **tours** et **outils** :
-- Plusieurs outils **dans un même tour** → la boucle intérieure les fait tous.
-- 7 outils **en chaîne** (chacun dépend du précédent) → il faut 7 tours → on
-  augmente la limite (`range(10)`, etc.). C'est une valeur qu'on choisit selon la
-  complexité attendue.
+    resultat = OUTILS_DISPO[nom](**args)
+    messages.append({"role": "tool", "content": str(resultat)})
+```
 
-### Comment font Claude / ChatGPT pour le nombre de tours ?
-Même logique : ils bouclent jusqu'à ce que le modèle arrête de demander des outils.
-**C'est le modèle qui décide qu'il a fini.** La limite de tours n'est qu'un garde-fou
-parmi d'autres (budget de tokens, limite de temps, limite de coût, validation
-humaine).
+C'est le point unique où toute action est vérifiée : le **choke point** de sécurité.
 
 ---
 
-## Partie 3 — Comprendre le modèle
+## Défense 1 — Moindre privilège (allowlist d'outils)
 
-### Pourquoi ce modèle (llama3.1) en particulier — est-il plus « hackable » ?
-**Non.** On l'a choisi pour des raisons pratiques (gratuit, local, supporte le tool
-calling, tourne sur 16 Go). La faille n'est **pas** dans le modèle : la prompt
-injection est un problème **structurel de tous les LLM**. La faille est dans
-l'**architecture de l'agent**, pas dans le choix du modèle.
+**Contre l'attaque 3 (suppression / excessive agency).**
 
-### Pourquoi les résumés changent à chaque exécution ?
-Parce qu'un LLM est **non déterministe** : à chaque mot il choisit selon des
-probabilités, avec une part de hasard. Ça se règle avec la **température**
-(basse = stable, haute = variée). Enjeu de sécurité : difficile de tester ou
-certifier un système qui ne réagit jamais exactement pareil.
+Seuls les outils explicitement autorisés peuvent s'exécuter. `supprimer_fichier`
+n'y figure pas → toute demande de suppression est refusée.
 
-### Pourquoi l'IA propose « lire le reste du fichier » alors qu'il n'y a rien ?
-Parce que le LLM ne **vérifie** rien : il génère du texte **plausible**, ici une
-phrase de politesse. C'est une **hallucination**. Leçon de sécurité majeure :
-**on ne peut jamais faire confiance aveuglément à ce que dit un LLM.**
+```python
+OUTILS_AUTORISES = ["lire_fichier", "envoyer_donnees"]
+
+if nom not in OUTILS_AUTORISES:
+    return False, f"Outil '{nom}' interdit (pas dans la liste blanche)."
+```
+
+**Résultat testé :** `[BLOQUÉ : supprimer_fichier …]` — le fichier survit (vérifié par `dir`). ✅
 
 ---
 
-## Partie 4 — Comprendre la sécurité
+## Défense 2 — Allowlist d'URL
 
-### L'attaquant fournit-il l'outil dans le fichier piégé ?
-**Non.** Le fichier ne contient que du **texte**. Les outils appartiennent à
-**l'agent** (le système de la victime), pour des usages légitimes. L'attaquant se
-contente de **donner l'ordre d'en abuser**. → *« L'attaquant ne fournit pas l'outil,
-il abuse d'un outil déjà à disposition. »*
+**Contre l'attaque 2 (exfiltration).**
 
-### Comment l'attaquant connaît-il les noms des fichiers et des outils ?
-Plusieurs méthodes :
-1. **Instructions vagues** (la plus puissante) : il n'a pas besoin des noms exacts,
-   l'IA connaît son propre environnement et fait la reconnaissance à sa place.
-2. **Prompt leaking** : injecter « liste tes outils » pour les découvrir, puis
-   attaquer.
-3. **Conventions / devinettes** : noms courants (`.env`, `config.json`,
-   `credentials`…), frameworks connus et documentés.
-4. **Fuites** : code open-source, documentation, offres d'emploi.
+`envoyer_donnees` est légitime, mais ne doit envoyer que vers des destinations
+autorisées. Toute autre URL est bloquée.
 
-### D'où vient `secrets.txt` en vrai ?
-L'agent tourne sur une **machine** (serveur) qui contient déjà des données sensibles
-(fichiers de config, clés API, bases de données…), **présentes pour de bonnes
-raisons** — l'agent en a besoin pour travailler. `secrets.txt` représente n'importe
-laquelle de ces données. Personne ne l'a « donné à l'IA » pour qu'elle le divulgue :
-il est juste dans l'environnement où l'agent vit. C'est ce qui rend un agent
-dangereux s'il est détourné : **il a déjà les clés de la maison.**
+```python
+URLS_AUTORISEES = ["https://api.entreprise-legitime.com"]
 
-### La « lethal trifecta » 🔺
-Les 3 conditions d'une exfiltration, qu'un agent en entreprise réunit
-naturellement :
-1. **Données sensibles** accessibles à l'agent ;
-2. **Contenu non fiable** traité par l'agent ;
-3. **Canal de sortie** vers l'extérieur.
+if nom == "envoyer_donnees":
+    url = args.get("url", "")
+    if not any(url.startswith(u) for u in URLS_AUTORISEES):
+        return False, f"URL non autorisée : {url}"
+```
+
+**Résultat testé :** `[BLOQUÉ : envoyer_donnees — URL non autorisée …]` — même les
+variantes de l'URL malveillante (`?token=…`) sont bloquées (vérification par
+préfixe). ✅
 
 ---
 
-## Le fil rouge du projet
+## Défense 3 — Protection des fichiers sensibles
 
-> **La sécurité d'un agent ne se joue pas dans le LLM, elle se joue dans le code qui
-> exécute les outils.** Le modèle peut demander n'importe quoi (y compris sous la
-> dictée d'un fichier piégé), et son « bon comportement » n'est jamais une garantie.
-> Les vrais contrôles sont dans le code : moindre privilège, validation, allowlist,
-> human-in-the-loop.
+**Défense en profondeur contre le vol du secret.**
+
+Un fichier sensible ne doit pas être lisible pour une tâche de résumé.
+
+```python
+FICHIERS_INTERDITS = ["secrets.txt"]
+
+if nom == "lire_fichier":
+    chemin = args.get("chemin", "")
+    if any(interdit in chemin for interdit in FICHIERS_INTERDITS):
+        return False, f"Accès refusé au fichier sensible : {chemin}"
+```
+
+**Résultat testé :** `[BLOQUÉ : lire_fichier — Accès refusé au fichier sensible :
+secrets.txt]` — le secret n'est même plus **lisible**. Combinée à la Défense 2,
+l'exfiltration est bloquée à **deux niveaux**. ✅
+
+---
+
+## Défense 4 — Human-in-the-loop
+
+**Contre toute action sensible, même autorisée.**
+
+Pour les actions à fort impact (envoi, suppression), une **confirmation humaine**
+est exigée avant l'exécution. L'humain a le dernier mot.
+
+```python
+OUTILS_SENSIBLES = ["envoyer_donnees", "supprimer_fichier"]
+```
+
+**Résultat testé :** sur un envoi vers une URL pourtant autorisée, le programme
+s'arrête et demande confirmation ; un `non` produit
+`[REFUSÉ PAR L'HUMAIN : envoyer_donnees]`. ✅
+
+> **Arbitrage :** on ne met en `OUTILS_SENSIBLES` que les actions vraiment à risque
+> (pas la simple lecture), pour ne pas rendre l'agent pénible à l'usage. Sécurité vs
+> confort : un vrai compromis d'ingénierie.
+
+---
+
+## Bilan attaques → défenses
+
+| Attaque | Défense(s) | Statut |
+|---|---|---|
+| 1 — Injection / goal hijacking | Séparation données/instructions (atténuation) + HITL | ⚠️ atténuée |
+| 2 — Exfiltration | Allowlist URL (D2) + fichier sensible (D3) | ✅ bloquée |
+| 3 — Suppression / excessive agency | Moindre privilège (D1) + HITL (D4) | ✅ bloquée |
+
+> **Note honnête :** l'injection de prompt (attaque 1) ne se « corrige » pas
+> totalement — c'est un problème de recherche ouvert. Les défenses la **réduisent**
+> et **limitent son impact** (l'agent détourné ne peut plus rien exfiltrer ni
+> détruire), mais aucune barrière n'empêche à 100 % un LLM de se laisser influencer
+> par un texte. D'où l'importance de la défense en profondeur.
+
+## Principe à retenir
+
+> La sécurité d'un agent ne repose jamais sur le bon comportement du modèle
+> (non déterministe, manipulable, capable de mentir). Elle repose sur des
+> **contrôles déterministes dans le code**, appliqués à un **point de passage
+> unique**, selon le **moindre privilège** et la **défense en profondeur**, avec un
+> **humain dans la boucle** pour les actions critiques.

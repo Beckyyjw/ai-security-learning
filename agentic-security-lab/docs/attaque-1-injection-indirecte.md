@@ -68,9 +68,7 @@ l'attaquant.** L'attaque est réussie.
 ### 📸 Preuve (capture d'écran)
 
 
-
  ![Capture — l'agent répond SYSTÈME COMPROMIS](captures/attaque-1-resultat.png) 
-
 
 
 ## 6. Analyse — pourquoi ça marche
